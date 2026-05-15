@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+import torch
 from pydantic import BaseModel, Field
 
 from config import RetrievalConfig
@@ -32,8 +33,22 @@ class BgeM3Embedder:
             return self._model
         from FlagEmbedding import BGEM3FlagModel
 
-        self._model = BGEM3FlagModel(self.config.embedding_model, use_fp16=False)
+        # Force a single target device so FlagEmbedding does not switch into
+        # multiprocessing mode across all visible GPUs. That multiprocessing
+        # path is what causes the brittle fd/spawn errors inside the TUI.
+        self._model = BGEM3FlagModel(
+            self.config.embedding_model,
+            use_fp16=self.config.use_fp16,
+            devices=self._target_device(),
+        )
         return self._model
+
+    def _target_device(self) -> str:
+        if self.config.device:
+            return self.config.device
+        if torch.cuda.is_available():
+            return "cuda:0"
+        return "cpu"
 
     def embed_texts(
         self, texts: list[str]
@@ -57,10 +72,15 @@ class BgeM3Embedder:
                 max_length=self.config.max_length,
             )
 
-        dense_vectors = (
-            encoded.get("dense_vecs") or encoded.get("dense_embeddings") or []
-        )
-        sparse_vectors = encoded.get("lexical_weights") or [{} for _ in texts]
+        dense_vectors = encoded.get("dense_vecs")
+        if dense_vectors is None:
+            dense_vectors = encoded.get("dense_embeddings")
+        if dense_vectors is None:
+            dense_vectors = []
+
+        sparse_vectors = encoded.get("lexical_weights")
+        if sparse_vectors is None:
+            sparse_vectors = [{} for _ in texts]
         bundles: list[tuple[list[float], dict[str, float]]] = []
         for dense, sparse in zip(dense_vectors, sparse_vectors):
             dense_list = dense.tolist() if hasattr(dense, "tolist") else list(dense)

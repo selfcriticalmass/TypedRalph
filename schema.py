@@ -5,6 +5,8 @@ import importlib
 import importlib.util
 import inspect
 import json
+import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
@@ -145,8 +147,30 @@ def _load_module_from_file(path: Path):
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not load registry module from {path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    with _temporary_import_roots(path):
+        spec.loader.exec_module(module)
     return module
+
+
+@contextmanager
+def _temporary_import_roots(path: Path):
+    resolved = path.resolve()
+    candidates = [
+        str(Path.cwd().resolve()),
+        str(resolved.parent),
+        str(resolved.parent.parent),
+    ]
+    inserted: list[str] = []
+    for candidate in candidates:
+        if candidate not in sys.path:
+            sys.path.insert(0, candidate)
+            inserted.append(candidate)
+    try:
+        yield
+    finally:
+        for candidate in inserted:
+            if candidate in sys.path:
+                sys.path.remove(candidate)
 
 
 def _coerce_registry_entry(entry: Any) -> FunctionSchema:

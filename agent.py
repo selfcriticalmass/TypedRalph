@@ -127,7 +127,15 @@ class CodeActAgent:
 
     def _run_schema(self, prompt: str) -> AgentResult:
         if not self.search_engine or not self.registry:
-            raise ValueError("Schema mode requires a loaded function registry")
+            registry_path = self.config.schema_config.registry_path
+            raise ValueError(
+                "Schema mode requires a loaded function registry"
+                + (
+                    f" (registry_path={registry_path!r})"
+                    if registry_path
+                    else " (registry_path is not set)"
+                )
+            )
 
         messages = [
             {

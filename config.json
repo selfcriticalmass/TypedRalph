@@ -1,0 +1,28 @@
+{
+  "mode": "schema",
+  "inference": {
+    "backend": "local_gemma",
+    "model_name": "google/gemma-4-31B-it",
+    "local_model_id": "google/gemma-4-31B-it",
+    "local_cache_root": ".venv/huggingface",
+    "download_if_missing": true,
+    "cfg_enabled": true,
+    "context_length": 8192,
+    "temperature": 0.2
+  },
+  "retrieval": {
+    "embedding_model": "BAAI/bge-m3",
+    "cache_path": "cache/vectors.parquet",
+    "top_k": 5
+  },
+  "execution": {
+    "workspace_root": ".",
+    "artifact_dir": "artifacts",
+    "free_mode_timeout": 30,
+    "schema_mode_timeout": 15,
+    "max_iterations": 8
+  },
+  "schema": {
+    "registry_path": "./examples/fasta_registry.py"
+  }
+}

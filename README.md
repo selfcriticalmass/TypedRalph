@@ -8,6 +8,8 @@ Terminal-native CodeAct agent with two execution modes:
 ## Features
 
 - Textual TUI with mode selection, backend selection, trace log, schema browser, and CFG/logits status
+- Built-in housekeeping checks for CUDA, local model presence, and OpenRouter capability probing
+- Built-in smoke tests for BGE-M3, local Gemma, and OpenRouter
 - Strict subprocess isolation for generated code and registered function execution
 - Pydantic function registry and argument validation
 - Hybrid function retrieval using lexical/type signals plus BGE-M3 docstring embeddings
@@ -22,8 +24,11 @@ Terminal-native CodeAct agent with two execution modes:
 codeact-agent/
 ├── agent.py
 ├── config.py
+├── data/
+├── diagnostics.py
 ├── embed.py
 ├── executor.py
+├── examples/
 ├── inference.py
 ├── pyproject.toml
 ├── schema.py
@@ -48,7 +53,26 @@ uv run codeact-agent
 
 If `config.json` exists in the project root, the TUI loads it automatically.
 
+## Config Location
+
+Place `config.json` in the project root, which is the directory where you run `uv run codeact-agent`.
+
+For this repository, that means:
+
+```text
+TypedRalph/config.json
+```
+
+The app currently looks for `config.json` in the current working directory on startup.
+The housekeeping flow also saves updated settings back to that same file by default.
+
 For one-off commands without installing globally, `uv run python -m ui.app` works too.
+
+For terminal diagnostics without launching the TUI:
+
+```bash
+uv run codeact-diagnostics --housekeeping --smoke
+```
 
 ## Example Config
 
@@ -61,6 +85,7 @@ For one-off commands without installing globally, `uv run python -m ui.app` work
     "local_model_id": "google/gemma-4-31B-it",
     "local_cache_root": ".venv/huggingface",
     "download_if_missing": true,
+    "openrouter_logprobs_supported": null,
     "cfg_enabled": true,
     "context_length": 8192,
     "temperature": 0.2
@@ -108,6 +133,38 @@ FUNCTION_REGISTRY = [
 ]
 ```
 
+## FASTA Example
+
+The repository now includes a schema-mode FASTA example under `examples/`:
+
+- `examples/fasta_tools.py`: reusable FASTA conversion and validation functions
+- `examples/fasta_registry.py`: schema registry exposing those functions
+- `examples/fasta_schema_config.json`: ready-to-run schema-mode config
+- `data/interleaved_example.fa`: small interleaved FASTA input for conversion testing
+- `data/Homo_sapiens_peptide_data.fa`: large peptide FASTA input for validation testing
+
+Example functions:
+
+- `convert_interleaved_fasta_to_sequential(input_path, output_path, line_width=80)`
+- `validate_fasta_file(file_path, alphabet="protein")`
+
+To run the example in schema mode:
+
+```bash
+cp examples/fasta_schema_config.json config.json
+uv run codeact-agent
+```
+
+Suggested prompts:
+
+```text
+Convert data/interleaved_example.fa into a sequential FASTA file at artifacts/interleaved_example.sequential.fa
+```
+
+```text
+Check whether data/Homo_sapiens_peptide_data.fa is a legal protein FASTA file
+```
+
 ## Secrets
 
 API keys resolve in this order:
@@ -145,7 +202,39 @@ This project uses `uv` as the source of truth for dependencies.
 - The local loader uses `AutoProcessor.from_pretrained(...)` and `AutoModelForCausalLM.from_pretrained(...)` against that uv-local cache.
 - Local transformers inference is treated as CFG-capable because it can expose generation scores and supports custom logits processors.
 - `openrouter` is the primary API backend and defaults to the same Gemma model id.
-- OpenRouter is shown as CFG-disabled unless explicitly overridden because it does not expose the full logits surface the local path can provide.
+- OpenRouter capability is now probed during housekeeping by making a small logprobs request against the selected model.
+- The probe result is written back into `config.json`, so the UI can distinguish `unverified`, `partial`, and `full` capability states.
+
+## Housekeeping And Smoke Tests
+
+Use the `Housekeeping` button in the TUI to run these checks:
+
+- CUDA availability
+- local Gemma cache presence
+- OpenRouter connectivity
+- OpenRouter logprobs support for the currently selected model
+
+The housekeeping run persists the updated capability result into `config.json`.
+
+Use the `Smoke` button in the TUI to run:
+
+- BGE-M3 embedding smoke test
+- local Gemma inference smoke test
+- OpenRouter inference smoke test when an API key is available
+
+You can also run both from the terminal:
+
+```bash
+uv run codeact-diagnostics --housekeeping --smoke
+```
+
+## Model Names
+
+The TUI now includes a model id input next to the backend selector.
+
+- Enter a newer model id there and press Enter to apply it
+- the app updates both the local Gemma model id and the OpenRouter model name together
+- the new selection is saved to `config.json`
 
 ## Local Gemma Bootstrap
 
@@ -153,8 +242,8 @@ The local workflow is designed around `uv`, Hugging Face, and a project-local `.
 
 1. `uv sync` creates the environment and installs the runtime.
 2. When you run the app with the `local_gemma` backend selected, it checks whether Gemma model assets are already available inside `.venv`.
-3. If they are missing and `download_if_missing` is enabled, it downloads the model into `.venv/models/...`.
-4. The backend then loads the tokenizer and weights from that local path and uses transformers generation with custom logits processor hooks enabled.
+3. If they are missing and `download_if_missing` is enabled, it downloads the model into the uv-local Hugging Face cache under `.venv/huggingface`.
+4. The backend then loads the processor and weights from the cached snapshot and uses transformers generation with custom logits processor hooks enabled.
 
 If the Gemma repo requires Hugging Face authentication, set `HF_TOKEN` before running the app.
 

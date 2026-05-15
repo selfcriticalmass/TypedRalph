@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Thread
 from typing import Any, Callable
@@ -17,6 +18,7 @@ ProgressCallback = Callable[[str], None]
 class BackendCapabilities(BaseModel):
     backend: str
     model_name: str
+    logits_mode: str = "unavailable"
     full_logits_available: bool
     full_vocab_logits: bool
     supports_custom_logits_processors: bool
@@ -52,6 +54,12 @@ class BaseInferenceBackend:
 
     def prepare(self, progress_callback: ProgressCallback | None = None) -> None:
         return None
+
+    def smoke_test(self) -> str:
+        response = self.generate(
+            [{"role": "user", "content": "Reply with exactly READY."}]
+        )
+        return response.text.strip()
 
     def generate(
         self,
@@ -107,6 +115,7 @@ class LocalGemmaBackend(BaseInferenceBackend):
         return BackendCapabilities(
             backend=self.config.backend.value,
             model_name=self.config.local_model_id,
+            logits_mode="full" if full_logits else "unavailable",
             full_logits_available=full_logits,
             full_vocab_logits=full_logits,
             supports_custom_logits_processors=supports_custom,
@@ -351,23 +360,39 @@ class OpenRouterBackend(BaseInferenceBackend):
         self._client = None
 
     def capabilities(self) -> BackendCapabilities:
-        full_logits = (
-            self.config.full_logits_override
-            if self.config.full_logits_override is not None
-            else False
-        )
+        logits_mode = self._logits_mode()
+        full_logits = logits_mode == "full"
         supports_custom = (
             self.config.supports_custom_logits_override
             if self.config.supports_custom_logits_override is not None
             else False
         )
-        cfg_state = "enabled" if self.config.cfg_enabled and full_logits else "disabled"
+        if self.config.cfg_enabled:
+            if logits_mode == "full":
+                cfg_state = "enabled"
+            elif logits_mode == "partial":
+                cfg_state = "partial"
+            elif logits_mode == "unverified":
+                cfg_state = "unverified"
+            else:
+                cfg_state = "disabled"
+        else:
+            cfg_state = "disabled"
         warning = None
-        if self.config.cfg_enabled and not full_logits:
-            warning = "CFG disabled: OpenRouter does not provide the full logits surface this app needs for guided decoding."
+        if self.config.cfg_enabled:
+            if logits_mode == "partial":
+                warning = (
+                    "OpenRouter logprobs probe passed for this model. CFG may be usable in a limited form, "
+                    "but provider-side custom logits processors are still unavailable."
+                )
+            elif logits_mode == "unverified":
+                warning = "OpenRouter CFG support is unverified. Run Housekeeping to probe logprobs support for the current model."
+            elif logits_mode == "unavailable":
+                warning = "CFG disabled: the last OpenRouter housekeeping probe did not find usable logprobs support for this model."
         return BackendCapabilities(
             backend=self.config.backend.value,
             model_name=self.config.model_name,
+            logits_mode=logits_mode,
             full_logits_available=full_logits,
             full_vocab_logits=full_logits,
             supports_custom_logits_processors=supports_custom,
@@ -436,6 +461,53 @@ class OpenRouterBackend(BaseInferenceBackend):
         )
         return self._client
 
+    def probe_logprobs_support(self) -> dict[str, Any]:
+        client = self._ensure_client()
+        try:
+            response = client.chat.completions.create(
+                model=self.config.model_name,
+                messages=[{"role": "user", "content": "Reply with exactly READY."}],
+                temperature=0,
+                max_tokens=4,
+                logprobs=True,
+                top_logprobs=5,
+                stream=False,
+            )
+        except Exception as exc:
+            return {
+                "accessible": False,
+                "logprobs_supported": False,
+                "notes": str(exc),
+            }
+
+        choice = response.choices[0]
+        logprobs = getattr(choice, "logprobs", None)
+        content = getattr(logprobs, "content", None) if logprobs is not None else None
+        supported = bool(content)
+        notes = None
+        if supported:
+            top_count = len(getattr(content[0], "top_logprobs", []) or [])
+            notes = f"Received token logprobs with {top_count} top-logprob entries on the first generated token."
+        else:
+            notes = "Request succeeded but the response did not include usable logprobs content."
+
+        return {
+            "accessible": True,
+            "logprobs_supported": supported,
+            "notes": notes,
+        }
+
+    def _logits_mode(self) -> str:
+        if self.config.full_logits_override is True:
+            return "full"
+        if self.config.full_logits_override is False:
+            return "unavailable"
+        if self.config.openrouter_logprobs_supported is True:
+            return "partial"
+        if self.config.openrouter_logprobs_supported is False:
+            return "unavailable"
+        return "unverified"
+
 
 def _cfg_state(cfg_enabled: bool, full_logits: bool) -> str:
     return "enabled" if cfg_enabled and full_logits else "disabled"
@@ -482,3 +554,15 @@ def build_backend(config: AppConfig) -> BaseInferenceBackend:
     if config.inference.backend == BackendType.OPENROUTER:
         return OpenRouterBackend(config)
     raise ValueError(f"Unsupported backend: {config.inference.backend}")
+
+
+def mark_openrouter_probe_result(
+    config: AppConfig,
+    *,
+    logprobs_supported: bool,
+    notes: str,
+) -> None:
+    config.inference.openrouter_logprobs_supported = logprobs_supported
+    config.inference.openrouter_cfg_checked_at = datetime.now(timezone.utc).isoformat()
+    config.inference.openrouter_cfg_checked_model = config.inference.model_name
+    config.inference.openrouter_cfg_probe_notes = notes

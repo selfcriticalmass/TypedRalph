@@ -19,7 +19,8 @@ from textual.widgets import (
 )
 
 from agent import CodeActAgent
-from config import AppConfig, BackendType, ExecutionMode, load_config
+from config import AppConfig, BackendType, ExecutionMode, load_config, save_config
+from diagnostics import DiagnosticReport, run_housekeeping, run_smoke_tests
 from executor import SubprocessExecutor
 from inference import BackendCapabilities, build_backend
 from schema import FunctionMatch, FunctionSchema, load_function_registry
@@ -114,17 +115,32 @@ class CodeActApp(App):
     }
 
     #controls {
+        layout: vertical;
         height: auto;
         padding: 1;
         border-top: solid $panel;
+    }
+
+    #toolbar {
+        height: auto;
+        margin-bottom: 1;
+    }
+
+    #prompt_bar {
+        height: auto;
     }
 
     #prompt_input {
         width: 1fr;
     }
 
+    #model_input {
+        width: 28;
+        margin-right: 1;
+    }
+
     Select {
-        width: 24;
+        width: 20;
         margin-right: 1;
     }
 
@@ -158,25 +174,34 @@ class CodeActApp(App):
             with Vertical(id="trace_panel"):
                 yield Label("Agent Trace")
                 yield RichLog(id="trace_log", wrap=True, highlight=False, markup=False)
-        with Horizontal(id="controls"):
-            yield Select(
-                [
-                    ("Free", ExecutionMode.FREE.value),
-                    ("Schema", ExecutionMode.SCHEMA.value),
-                ],
-                value=self.config.mode.value,
-                id="mode_select",
-            )
-            yield Select(
-                [
-                    ("Local Gemma", BackendType.LOCAL_GEMMA.value),
-                    ("OpenRouter", BackendType.OPENROUTER.value),
-                ],
-                value=self.config.inference.backend.value,
-                id="backend_select",
-            )
-            yield Button("Run", variant="primary", id="run_button")
-            yield Input(placeholder="Enter a task for the agent", id="prompt_input")
+        with Vertical(id="controls"):
+            with Horizontal(id="toolbar"):
+                yield Select(
+                    [
+                        ("Free", ExecutionMode.FREE.value),
+                        ("Schema", ExecutionMode.SCHEMA.value),
+                    ],
+                    value=self.config.mode.value,
+                    id="mode_select",
+                )
+                yield Select(
+                    [
+                        ("Local Gemma", BackendType.LOCAL_GEMMA.value),
+                        ("OpenRouter", BackendType.OPENROUTER.value),
+                    ],
+                    value=self.config.inference.backend.value,
+                    id="backend_select",
+                )
+                yield Input(
+                    value=self.config.inference.model_name,
+                    placeholder="Model id",
+                    id="model_input",
+                )
+                yield Button("Housekeeping", id="housekeeping_button")
+                yield Button("Smoke", id="smoke_button")
+            with Horizontal(id="prompt_bar"):
+                yield Input(placeholder="Enter a task for the agent", id="prompt_input")
+                yield Button("Run", variant="primary", id="run_button")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -198,9 +223,7 @@ class CodeActApp(App):
             readiness = "bootstrap"
         elif self.capabilities.model_available is False:
             readiness = "missing"
-        logits_label = (
-            "full" if self.capabilities.full_logits_available else "unavailable"
-        )
+        logits_label = self.capabilities.logits_mode
         status = (
             f"Mode: {self.config.mode.value} | "
             f"Backend: {self.config.inference.backend.value} | "
@@ -216,6 +239,42 @@ class CodeActApp(App):
         self.backend = build_backend(self.config)
         self.capabilities = self.backend.capabilities()
         self._refresh_status()
+
+    def _config_save_path(self) -> str:
+        if self.config_path:
+            return self.config_path
+        return str(Path(self.config.execution.workspace_root) / "config.json")
+
+    def _reload_config_from_disk(self) -> None:
+        config_path = self._config_save_path()
+        path = Path(config_path)
+        if not path.exists():
+            return
+
+        runtime_api_key = self.config.inference.runtime_api_key
+        runtime_hf_token = self.config.inference.runtime_hf_token
+        loaded = load_config(config_path)
+        loaded.inference.runtime_api_key = runtime_api_key
+        loaded.inference.runtime_hf_token = runtime_hf_token
+        self.config = loaded
+
+        self.query_one("#mode_select", Select).value = self.config.mode.value
+        self.query_one(
+            "#backend_select", Select
+        ).value = self.config.inference.backend.value
+        self.query_one("#model_input", Input).value = self.config.inference.model_name
+
+        self.backend = build_backend(self.config)
+        self.capabilities = self.backend.capabilities()
+        self._reload_registry()
+        self._refresh_status()
+
+    def _sync_model_name_from_ui(self) -> None:
+        model_value = self.query_one("#model_input", Input).value.strip()
+        previous_name = self.config.inference.model_name
+        self.config.inference.apply_model_name(model_value)
+        if self.config.inference.model_name != previous_name:
+            self._reload_backend()
 
     def _set_capabilities(self, capabilities: BackendCapabilities) -> None:
         self.capabilities = capabilities
@@ -236,7 +295,7 @@ class CodeActApp(App):
             self.call_from_thread(self._append_trace, "warning", str(exc))
 
     def _reload_registry(self) -> None:
-        registry_path = self.config.schema.registry_path
+        registry_path = self.config.schema_config.registry_path
         if not registry_path:
             self.registry = []
             self.search_engine = None
@@ -270,6 +329,16 @@ class CodeActApp(App):
         log = self.query_one("#trace_log", RichLog)
         log.write(f"[{event_type.upper()}]\n{content}\n")
 
+    def _append_report(self, report: DiagnosticReport) -> None:
+        if report.config_updated and report.config_path:
+            self._append_trace("system", f"Saved config to {report.config_path}")
+        for check in report.checks:
+            self._append_trace(
+                check.status,
+                f"{check.name}: {check.summary}"
+                + (f"\n{check.details}" if check.details else ""),
+            )
+
     def _combined_warning(self) -> str:
         warnings = []
         if self.capabilities.warning:
@@ -286,6 +355,22 @@ class CodeActApp(App):
     @on(Button.Pressed, "#run_button")
     def on_run_button(self) -> None:
         self._start_run()
+
+    @on(Button.Pressed, "#housekeeping_button")
+    def on_housekeeping_button(self) -> None:
+        self._start_housekeeping()
+
+    @on(Button.Pressed, "#smoke_button")
+    def on_smoke_button(self) -> None:
+        self._start_smoke_tests()
+
+    @on(Input.Submitted, "#model_input")
+    def on_model_submit(self) -> None:
+        self._sync_model_name_from_ui()
+        save_config(self.config, self._config_save_path())
+        self._append_trace(
+            "system", f"Saved model selection to {self._config_save_path()}"
+        )
 
     @on(Input.Submitted, "#prompt_input")
     def on_prompt_submit(self) -> None:
@@ -312,6 +397,8 @@ class CodeActApp(App):
         self._reload_backend()
 
     def _start_run(self) -> None:
+        self._reload_config_from_disk()
+        self._sync_model_name_from_ui()
         prompt = self.query_one("#prompt_input", Input).value.strip()
         if not prompt:
             return
@@ -323,6 +410,14 @@ class CodeActApp(App):
             return
         self._run_prompt(prompt)
 
+    def _start_housekeeping(self) -> None:
+        self._sync_model_name_from_ui()
+        self._run_housekeeping()
+
+    def _start_smoke_tests(self) -> None:
+        self._sync_model_name_from_ui()
+        self._run_smoke_tests()
+
     def _handle_runtime_key(self, value: str | None) -> None:
         if value:
             self.config.inference.runtime_api_key = value
@@ -330,6 +425,43 @@ class CodeActApp(App):
             prompt = self.query_one("#prompt_input", Input).value.strip()
             if prompt:
                 self._run_prompt(prompt)
+
+    @work(thread=True, exclusive=True)
+    def _run_housekeeping(self) -> None:
+        self.call_from_thread(
+            self._append_trace, "system", "Starting housekeeping checks"
+        )
+        try:
+            report = run_housekeeping(
+                self.config,
+                config_path=self._config_save_path(),
+                progress_callback=lambda message: self.call_from_thread(
+                    self._append_trace,
+                    "system",
+                    message,
+                ),
+            )
+            self.backend = build_backend(self.config)
+            self.call_from_thread(self._set_capabilities, self.backend.capabilities())
+            self.call_from_thread(self._append_report, report)
+        except Exception as exc:
+            self.call_from_thread(self._append_trace, "error", str(exc))
+
+    @work(thread=True, exclusive=True)
+    def _run_smoke_tests(self) -> None:
+        self.call_from_thread(self._append_trace, "system", "Starting smoke tests")
+        try:
+            report = run_smoke_tests(
+                self.config,
+                progress_callback=lambda message: self.call_from_thread(
+                    self._append_trace,
+                    "system",
+                    message,
+                ),
+            )
+            self.call_from_thread(self._append_report, report)
+        except Exception as exc:
+            self.call_from_thread(self._append_trace, "error", str(exc))
 
     @work(thread=True, exclusive=True)
     def _run_prompt(self, prompt: str) -> None:

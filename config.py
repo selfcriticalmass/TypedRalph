@@ -54,6 +54,10 @@ class InferenceConfig(BaseModel):
     stop_tokens: list[str] = Field(default_factory=list)
     full_logits_override: bool | None = None
     supports_custom_logits_override: bool | None = None
+    openrouter_logprobs_supported: bool | None = None
+    openrouter_cfg_checked_at: str | None = None
+    openrouter_cfg_checked_model: str | None = None
+    openrouter_cfg_probe_notes: str | None = None
     device_map: str = "auto"
     torch_dtype: str = "auto"
     attn_implementation: str | None = None
@@ -112,6 +116,13 @@ class InferenceConfig(BaseModel):
                 return value
         return self.runtime_hf_token
 
+    def apply_model_name(self, model_name: str) -> None:
+        normalized = model_name.strip()
+        if not normalized:
+            return
+        self.model_name = normalized
+        self.local_model_id = normalized
+
 
 class RetrievalConfig(BaseModel):
     embedding_model: str = "BAAI/bge-m3"
@@ -119,6 +130,8 @@ class RetrievalConfig(BaseModel):
     top_k: int = 5
     rrf_k: int = 60
     semantic_enabled: bool = True
+    device: str | None = None
+    use_fp16: bool = False
     batch_size: int = 8
     max_length: int = 2048
 
@@ -140,11 +153,13 @@ class SchemaConfig(BaseModel):
 
 
 class AppConfig(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     ui: UIConfig = Field(default_factory=UIConfig)
     inference: InferenceConfig = Field(default_factory=InferenceConfig)
     retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
-    schema: SchemaConfig = Field(default_factory=SchemaConfig)
+    schema_config: SchemaConfig = Field(default_factory=SchemaConfig, alias="schema")
     mode: ExecutionMode = ExecutionMode.FREE
 
     @classmethod
@@ -177,3 +192,20 @@ def load_dotenv_values(path: Path) -> dict[str, str]:
 
 def load_config(path: str | Path | None = None) -> AppConfig:
     return AppConfig.load(path)
+
+
+def save_config(config: AppConfig, path: str | Path) -> None:
+    config_path = Path(path)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = config.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+        exclude={
+            "inference": {
+                "runtime_api_key",
+                "runtime_hf_token",
+            }
+        },
+    )
+    config_path.write_text(json.dumps(payload, indent=2) + "\n")

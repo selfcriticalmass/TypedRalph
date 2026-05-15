@@ -29,7 +29,8 @@ dependencies = [
 
 [project.scripts]
 codeact-agent = "ui.app:main"
+codeact-diagnostics = "diagnostics:main"
 
 [tool.setuptools]
-py-modules = ["agent", "config", "embed", "executor", "inference", "schema", "search"]
+py-modules = ["agent", "config", "diagnostics", "embed", "executor", "inference", "schema", "search"]
 packages = ["ui"]
